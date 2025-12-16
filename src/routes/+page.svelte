@@ -1,11 +1,194 @@
 <script lang="ts">
-  import _state from '$lib/state';
-  import { fetchDhParams, generateIdentityKey, connect, sendMessage } from '$lib/api';
   import { onMount } from 'svelte';
+  import { Stomp } from '@stomp/stompjs';
+  import type { CompatClient } from '@stomp/stompjs';
 
+  const deriveAesKey = async (sharedSecret: bigint): Promise<CryptoKey> => {
+    const raw = new TextEncoder().encode(sharedSecret.toString(16));
+    const hash = await crypto.subtle.digest('SHA-256', raw);
+    return crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  };
+
+  const aesEncrypt = async (
+    key: CryptoKey,
+    plaintext: string
+  ): Promise<{ nonce: string; ciphertext: string }> => {
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: nonce },
+      key,
+      new TextEncoder().encode(plaintext)
+    );
+    return {
+      nonce: btoa(String.fromCharCode(...nonce)),
+      ciphertext: btoa(String.fromCharCode(...new Uint8Array(ct)))
+    };
+  };
+
+  const aesDecrypt = async (
+    key: CryptoKey,
+    nonceB64: string,
+    ciphertextB64: string
+  ): Promise<string> => {
+    const nonce = Uint8Array.from(atob(nonceB64), (c) => c.charCodeAt(0));
+    const ct = Uint8Array.from(atob(ciphertextB64), (c) => c.charCodeAt(0));
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ct);
+    return new TextDecoder().decode(pt);
+  };
+
+  const fetchDhParams = async () => {
+    const res = await fetch('http://localhost:8080/params');
+    const json = await res.json();
+    State.p = BigInt('0x' + json.p);
+    State.g = BigInt('0x' + json.g);
+  };
+
+  const generateIdentityKey = () => {
+    State.identityPriv = randomBigInt(256);
+    State.identityPub = modPow(State.g, State.identityPriv, State.p);
+  };
+
+  const connect = () => {
+    const client = Stomp.client('ws://localhost:8080/ws');
+
+    client.onConnect = () => {
+      // Register identity public key
+      client.publish({
+        destination: '/app/registerKey',
+        body: bigIntToBase64(State.identityPub)
+      });
+
+      // Receive session Id
+      client.subscribe('/user/queue/session', (msg) => {
+        State.sessionId = msg.body;
+      });
+
+      // Receive public key list
+      client.subscribe('/topic/publicKeys', (msg) => {
+        const keys: { id: string; pub: string } = JSON.parse(msg.body);
+        State.users = Object.fromEntries(
+          Object.entries(keys).map(([id, pub]) => [id, base64ToBigInt(pub)])
+        );
+      });
+
+      // Receive encrypted messages
+      client.subscribe('/queue/messages', async (msg) => {
+        const data = JSON.parse(msg.body);
+        try {
+          await handleIncomingMessage(data);
+        } catch (e) {
+          console.log(e);
+        }
+      });
+    };
+
+    client.activate();
+    State.stomp = client;
+  };
+
+  const sendMessage = async (text: string) => {
+    let recipients: any = [];
+
+    for (const recipientId in State.users) {
+      if (recipientId === State.sessionId) continue;
+
+      // Ephemeral DH
+      const ephPriv = randomBigInt(256);
+      const ephPub = modPow(State.g, ephPriv, State.p);
+      const shared = modPow(State.users[recipientId], ephPriv, State.p);
+
+      const aesKey = await deriveAesKey(shared);
+      const encrypted = await aesEncrypt(aesKey, text);
+
+      recipients.push({
+        recipientId,
+        senderEphemeralKey: bigIntToBase64(ephPub),
+        nonce: encrypted.nonce,
+        ciphertext: encrypted.ciphertext
+      });
+    }
+
+    State.stomp?.publish({
+      destination: '/app/sendMessage',
+      body: JSON.stringify({
+        senderId: State.sessionId,
+        recipients
+      })
+    });
+    // For FE presentation
+    State.messages = [...State.messages, { senderId: 'me', message: text }];
+  };
+
+  const handleIncomingMessage = async (msg: {
+    senderId: string;
+    senderEphemeralKey: string;
+    nonce: string;
+    ciphertext: string;
+  }) => {
+    const senderEphPub = base64ToBigInt(msg.senderEphemeralKey);
+    const shared = modPow(senderEphPub, State.identityPriv, State.p);
+    const aesKey = await deriveAesKey(shared);
+
+    const plaintext = await aesDecrypt(aesKey, msg.nonce, msg.ciphertext);
+
+    console.log(`Message from ${msg.senderId}:`, plaintext);
+    State.messages = [...State.messages, { senderId: msg.senderId, message: plaintext }];
+  };
+  const modPow = (base: bigint, exp: bigint, mod: bigint): bigint => {
+    let result = 1n;
+    base = base % mod;
+    while (exp > 0n) {
+      if (exp & 1n) result = (result * base) % mod;
+      exp >>= 1n;
+      base = (base * base) % mod;
+    }
+    return result;
+  };
+
+  const randomBigInt = (bits: number): bigint => {
+    const bytes = Math.ceil(bits / 8);
+    const buf = crypto.getRandomValues(new Uint8Array(bytes));
+    return BigInt('0x' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join(''));
+  };
+
+  const bigIntToBase64 = (bi: bigint): string => {
+    return btoa(bi.toString(16));
+  };
+
+  const base64ToBigInt = (b64: string): bigint => {
+    return BigInt('0x' + atob(b64));
+  };
+
+  type ClientState = {
+    p: bigint;
+    g: bigint;
+
+    identityPriv: bigint;
+    identityPub: bigint;
+
+    users: Record<string, bigint>;
+
+    stomp: CompatClient | null;
+    sessionId: string;
+    messages: { senderId: string; message: string }[];
+  };
+
+  let State: ClientState = $state({
+    p: BigInt(0),
+    g: BigInt(0),
+
+    identityPriv: BigInt(0),
+    identityPub: BigInt(0),
+
+    users: {} as Record<string, bigint>,
+
+    stomp: null,
+    sessionId: '',
+    messages: []
+  });
+
+  ////
   let message = $state('');
-  let State = $derived(_state);
-  let sessionId = $derived(State.sessionId);
   let status = $derived(State.stomp == null);
 
   onMount(async () => {
@@ -13,7 +196,6 @@
     generateIdentityKey();
     connect();
   });
-  let messages: { senderId: string; message: string }[] = $state([]);
 </script>
 
 <div class="container">
@@ -21,21 +203,21 @@
 
   <div class="status">
     Status: <b>{status ? 'connecting...' : 'connected'}</b><br />
-    Session ID: {sessionId}
+    Session ID: {State.sessionId}
   </div>
 
   <div class="users">
     Connected users:
     <ul>
-      {#each State.users as u}
+      {#each Object.keys(State.users) as u}
         <li>{u}</li>
       {/each}
     </ul>
   </div>
 
   <div class="chat">
-    {#each messages as m}
-      <p class="message"><b>{m.senderId}</b>:{m.message}</p>
+    {#each State.messages as m}
+      <p class="message"><b>{m.senderId}</b>: {m.message}</p>
     {/each}
   </div>
 
