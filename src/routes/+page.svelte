@@ -36,37 +36,37 @@
     return new TextDecoder().decode(pt);
   };
 
-  const fetchDhParams = async () => {
+  const fetchDhParams = async (state: ClientState) => {
     const res = await fetch('http://localhost:8080/params');
     const json = await res.json();
-    State.p = BigInt('0x' + json.p);
-    State.g = BigInt('0x' + json.g);
+    state.p = BigInt('0x' + json.p);
+    state.g = BigInt('0x' + json.g);
   };
 
-  const generateIdentityKey = () => {
-    State.identityPriv = randomBigInt(256);
-    State.identityPub = modPow(State.g, State.identityPriv, State.p);
+  const generateIdentityKey = (state: ClientState) => {
+    state.identityPriv = randomBigInt(256);
+    state.identityPub = modPow(state.g, state.identityPriv, state.p);
   };
 
-  const connect = () => {
+  const connect = (state: ClientState) => {
     const client = Stomp.client('ws://localhost:8080/ws');
 
     client.onConnect = () => {
       // Register identity public key
       client.publish({
         destination: '/app/registerKey',
-        body: bigIntToBase64(State.identityPub)
+        body: bigIntToBase64(state.identityPub)
       });
 
       // Receive session Id
       client.subscribe('/user/queue/session', (msg) => {
-        State.sessionId = msg.body;
+        state.sessionId = msg.body;
       });
 
       // Receive public key list
       client.subscribe('/topic/publicKeys', (msg) => {
         const keys: { id: string; pub: string } = JSON.parse(msg.body);
-        State.users = Object.fromEntries(
+        state.users = Object.fromEntries(
           Object.entries(keys).map(([id, pub]) => [id, base64ToBigInt(pub)])
         );
       });
@@ -75,7 +75,7 @@
       client.subscribe('/queue/messages', async (msg) => {
         const data = JSON.parse(msg.body);
         try {
-          await handleIncomingMessage(data);
+          await handleIncomingMessage(data, state);
         } catch (e) {
           console.log(e);
         }
@@ -83,19 +83,19 @@
     };
 
     client.activate();
-    State.stomp = client;
+    state.stomp = client;
   };
 
-  const sendMessage = async (text: string) => {
+  const sendMessage = async (text: string, state: ClientState) => {
     let recipients: any = [];
 
-    for (const recipientId in State.users) {
-      if (recipientId === State.sessionId) continue;
+    for (const recipientId in state.users) {
+      if (recipientId === state.sessionId) continue;
 
       // Ephemeral DH
       const ephPriv = randomBigInt(256);
-      const ephPub = modPow(State.g, ephPriv, State.p);
-      const shared = modPow(State.users[recipientId], ephPriv, State.p);
+      const ephPub = modPow(state.g, ephPriv, state.p);
+      const shared = modPow(state.users[recipientId], ephPriv, state.p);
 
       const aesKey = await deriveAesKey(shared);
       const encrypted = await aesEncrypt(aesKey, text);
@@ -108,31 +108,34 @@
       });
     }
 
-    State.stomp?.publish({
+    state.stomp?.publish({
       destination: '/app/sendMessage',
       body: JSON.stringify({
-        senderId: State.sessionId,
+        senderId: state.sessionId,
         recipients
       })
     });
     // For FE presentation
-    State.messages = [...State.messages, { senderId: 'me', message: text }];
+    state.messages = [...state.messages, { senderId: 'me', message: text }];
   };
 
-  const handleIncomingMessage = async (msg: {
-    senderId: string;
-    senderEphemeralKey: string;
-    nonce: string;
-    ciphertext: string;
-  }) => {
+  const handleIncomingMessage = async (
+    msg: {
+      senderId: string;
+      senderEphemeralKey: string;
+      nonce: string;
+      ciphertext: string;
+    },
+    state: ClientState
+  ) => {
     const senderEphPub = base64ToBigInt(msg.senderEphemeralKey);
-    const shared = modPow(senderEphPub, State.identityPriv, State.p);
+    const shared = modPow(senderEphPub, state.identityPriv, state.p);
     const aesKey = await deriveAesKey(shared);
 
     const plaintext = await aesDecrypt(aesKey, msg.nonce, msg.ciphertext);
 
     console.log(`Message from ${msg.senderId}:`, plaintext);
-    State.messages = [...State.messages, { senderId: msg.senderId, message: plaintext }];
+    state.messages = [...state.messages, { senderId: msg.senderId, message: plaintext }];
   };
   const modPow = (base: bigint, exp: bigint, mod: bigint): bigint => {
     let result = 1n;
@@ -197,9 +200,9 @@
   let status = $derived(State.stomp == null);
 
   onMount(async () => {
-    await fetchDhParams();
-    generateIdentityKey();
-    connect();
+    await fetchDhParams(State);
+    generateIdentityKey(State);
+    connect(State);
   });
 </script>
 
@@ -230,7 +233,7 @@
     <input type="text" placeholder="Type a message…" bind:value={message} />
     <button
       onclick={() => {
-        sendMessage(message);
+        sendMessage(message, State);
         message = '';
       }}>Send</button
     >
