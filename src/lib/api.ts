@@ -1,65 +1,68 @@
 import { Stomp } from '@stomp/stompjs';
 import { base64ToBigInt, bigIntToBase64, modPow, randomBigInt } from './math';
-import _state from './state'
+import { type ClientState } from './state'
 import { deriveAesKey, aesEncrypt, aesDecrypt } from './aes';
 
-export const fetchDhParams = async () => {
-    const res = await fetch("http://localhost:8080/params");
+export const fetchDhParams = async (state: ClientState) => {
+    const res = await fetch('http://localhost:8080/params');
     const json = await res.json();
-    _state.p = BigInt("0x" + json.p);
-    _state.g = BigInt("0x" + json.g);
-}
+    state.p = BigInt('0x' + json.p);
+    state.g = BigInt('0x' + json.g);
+};
 
-export const generateIdentityKey = () => {
-    _state.identityPriv = randomBigInt(256);
-    _state.identityPub = modPow(_state.g, _state.identityPriv, _state.p);
-}
+export const generateIdentityKey = (state: ClientState) => {
+    state.identityPriv = randomBigInt(256);
+    state.identityPub = modPow(state.g, state.identityPriv, state.p);
+};
 
-export const connect = () => {
-    const client = Stomp.client("ws://localhost:8080/ws")
+export const connect = (state: ClientState) => {
+    const client = Stomp.client('ws://localhost:8080/ws');
 
     client.onConnect = () => {
         // Register identity public key
         client.publish({
-            destination: "/app/registerKey",
-            body: bigIntToBase64(_state.identityPub)
+            destination: '/app/registerKey',
+            body: bigIntToBase64(state.identityPub)
         });
 
         // Receive session Id
-        client.subscribe("/user/queue/session", msg => {
-            _state.sessionId = msg.body;
+        client.subscribe('/user/queue/session', (msg) => {
+            state.sessionId = msg.body;
         });
 
         // Receive public key list
-        client.subscribe("/topic/publicKeys", msg => {
-            const keys: { id: string, pub: string } = JSON.parse(msg.body);
-            _state.users.clear();
-            for (const [id, pub] of Object.entries(keys)) {
-                _state.users.set(id, base64ToBigInt(pub));
-            }
+        client.subscribe('/topic/publicKeys', (msg) => {
+            const keys: { id: string; pub: string } = JSON.parse(msg.body);
+            state.users = Object.fromEntries(
+                Object.entries(keys).map(([id, pub]) => [id, base64ToBigInt(pub)])
+            );
         });
 
         // Receive encrypted messages
-        client.subscribe("/user/queue/messages", async msg => {
+        client.subscribe('/queue/messages', async (msg) => {
             const data = JSON.parse(msg.body);
-            await handleIncomingMessage(data);
+            try {
+                await handleIncomingMessage(data, state);
+            } catch (e) {
+                console.log(e);
+            }
         });
     };
 
     client.activate();
-    _state.stomp = client;
-}
+    state.stomp = client;
+};
 
-export const sendMessage = async (text: string) => {
-    const recipients = [];
+export const sendMessage = async (text: string, state: ClientState) => {
+    let recipients: any = [];
 
-    for (const [recipientId, recipientPub] of _state.users.entries()) {
-        if (recipientId === _state.sessionId) continue;
+    for (const recipientId in state.users) {
+        if (recipientId === state.sessionId) continue;
 
         // Ephemeral DH
         const ephPriv = randomBigInt(256);
-        const ephPub = modPow(_state.g, ephPriv, _state.p);
-        const shared = modPow(recipientPub, ephPriv, _state.p);
+        const ephPub = modPow(state.g, ephPriv, state.p);
+        const shared = modPow(state.users[recipientId], ephPriv, state.p);
 
         const aesKey = await deriveAesKey(shared);
         const encrypted = await aesEncrypt(aesKey, text);
@@ -72,26 +75,33 @@ export const sendMessage = async (text: string) => {
         });
     }
 
-    _state.stomp?.publish({
-        destination: "/app/sendMessage",
+    state.stomp?.publish({
+        destination: '/app/sendMessage',
         body: JSON.stringify({
-            senderId: _state.sessionId,
+            senderId: state.sessionId,
             recipients
         })
     });
-}
+    // For FE presentation
+    state.messages = [...state.messages, { senderId: 'me', message: text }];
+};
 
-export const handleIncomingMessage = async (msg: { senderId: string, senderEphemeralKey: string; nonce: string; ciphertext: string }) => {
+export const handleIncomingMessage = async (
+    msg: {
+        senderId: string;
+        senderEphemeralKey: string;
+        nonce: string;
+        ciphertext: string;
+    },
+    state: ClientState
+) => {
     const senderEphPub = base64ToBigInt(msg.senderEphemeralKey);
-    const shared = modPow(senderEphPub, _state.identityPriv, _state.p);
+    const shared = modPow(senderEphPub, state.identityPriv, state.p);
     const aesKey = await deriveAesKey(shared);
 
-    const plaintext = await aesDecrypt(
-        aesKey,
-        msg.nonce,
-        msg.ciphertext
-    );
+    const plaintext = await aesDecrypt(aesKey, msg.nonce, msg.ciphertext);
 
     console.log(`Message from ${msg.senderId}:`, plaintext);
-    _state.messages.push({ senderId: msg.senderId, message: plaintext })
-}
+    state.messages = [...state.messages, { senderId: msg.senderId, message: plaintext }];
+};
+
