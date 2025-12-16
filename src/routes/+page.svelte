@@ -188,6 +188,11 @@
   });
 
   ////
+  const printTime = (): string => {
+    const d = new Date();
+    return `${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}`;
+  };
+
   let message = $state('');
   let status = $derived(State.stomp == null);
 
@@ -217,7 +222,7 @@
 
   <div class="chat">
     {#each State.messages as m}
-      <p class="message"><b>{m.senderId}</b>: {m.message}</p>
+      <p class="message">[{printTime()}] <b>{m.senderId.substring(0, 6)}</b>: {m.message}</p>
     {/each}
   </div>
 
