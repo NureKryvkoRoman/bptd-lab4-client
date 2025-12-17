@@ -10,4 +10,4 @@ Run:
 npm run dev
 ```
 
-The client will be server at http://localhost:5137.
+The client will be served at http://localhost:5137.
